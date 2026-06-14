@@ -1,0 +1,13 @@
+[package]
+name = "app-storage"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+app-core = { path = "../app-core" }
+crossbeam-channel.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

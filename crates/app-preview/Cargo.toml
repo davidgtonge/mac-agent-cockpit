@@ -1,0 +1,10 @@
+[package]
+name = "app-preview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+app-core = { path = "../app-core" }
+regex = "1"
+serde = { workspace = true }
+thiserror = { workspace = true }

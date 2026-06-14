@@ -1,0 +1,15 @@
+[package]
+name = "app-workspace"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+app-core = { path = "../app-core" }
+crossbeam-channel = { workspace = true }
+ignore = "0.4"
+notify = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = "2.7"
+syntect = "5.2"
+thiserror = { workspace = true }

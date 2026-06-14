@@ -1,0 +1,26 @@
+[package]
+name = "app-tauri"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+app-core = { path = "../crates/app-core" }
+app-storage = { path = "../crates/app-storage" }
+app-agent = { path = "../crates/app-agent" }
+app-process = { path = "../crates/app-process" }
+app-workspace = { path = "../crates/app-workspace" }
+app-preview = { path = "../crates/app-preview" }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+dirs = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { workspace = true }
+tauri-plugin-dialog = "2"
+tokio = { workspace = true }
+url = "2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
