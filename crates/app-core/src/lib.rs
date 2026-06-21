@@ -1655,7 +1655,7 @@ impl Engine {
                     .get(&project_id)
                     .cloned()
                     .ok_or_else(|| EngineError::NotFound(project_id.to_string()))?;
-                self.state.selected_project_id = Some(project_id.clone());
+                switch_selected_project(&mut self.state, project_id.clone());
                 if !self.state.file_tree.contains_key(".") {
                     effects.push(EffectCommand::LoadDirectory {
                         effect_id: EffectId::new(),
@@ -1680,7 +1680,7 @@ impl Engine {
                     .find(|p| p.path == path)
                     .cloned()
                 {
-                    self.state.selected_project_id = Some(existing.id.clone());
+                    switch_selected_project(&mut self.state, existing.id.clone());
                     effects.push(EffectCommand::LoadDirectory {
                         effect_id: EffectId::new(),
                         project_id: existing.id,
@@ -1697,7 +1697,7 @@ impl Engine {
                 if !self.state.project_order.contains(&project_id) {
                     self.state.project_order.push(project_id.clone());
                 }
-                self.state.selected_project_id = Some(project_id.clone());
+                switch_selected_project(&mut self.state, project_id.clone());
                 effects.push(EffectCommand::WriteProject {
                     effect_id: EffectId::new(),
                     project,
@@ -1720,7 +1720,7 @@ impl Engine {
                     self.state.projects.contains_key(&project_id),
                     &project_id.to_string(),
                 )?;
-                self.state.selected_project_id = Some(project_id.clone());
+                let project_changed = switch_selected_project(&mut self.state, project_id.clone());
                 let conversation = Conversation::new(project_id.clone());
                 let conversation_id = conversation.id.clone();
                 self.state
@@ -1741,13 +1741,24 @@ impl Engine {
                     effect_id: EffectId::new(),
                     conversation,
                 });
-                if let Some(project) = self.state.projects.get(&project_id) {
+                if let Some(project) = self.state.projects.get(&project_id).cloned() {
                     effects.push(EffectCommand::CaptureSessionBaseRevision {
                         effect_id: EffectId::new(),
                         conversation_id: conversation_id.clone(),
                         project_id: project_id.clone(),
                         project_path: project.path.clone(),
                     });
+                    if !self.state.file_tree.contains_key(".") {
+                        effects.push(EffectCommand::LoadDirectory {
+                            effect_id: EffectId::new(),
+                            project_id: project_id.clone(),
+                            project_path: project.path.clone(),
+                            path: ".".into(),
+                        });
+                    }
+                    if project_changed {
+                        self.queue_git_refresh(&project_id, &project.path, effects)?;
+                    }
                 }
                 self.request_acp_connection(&conversation_id, effects)?;
             }
@@ -1757,15 +1768,27 @@ impl Engine {
                         persist_conversation_workspace(&mut self.state, &previous_id, effects);
                     }
                 }
+                let project_id = self
+                    .state
+                    .conversations
+                    .get(&conversation_id)
+                    .ok_or_else(|| EngineError::NotFound(conversation_id.to_string()))?
+                    .project_id
+                    .clone();
+                let project_changed = switch_selected_project(&mut self.state, project_id.clone());
                 let c = self
                     .state
                     .conversations
                     .get_mut(&conversation_id)
                     .ok_or_else(|| EngineError::NotFound(conversation_id.to_string()))?;
                 c.last_opened_at = Some(now_ms());
-                self.state.selected_project_id = Some(c.project_id.clone());
                 self.state.selected_conversation_id = Some(conversation_id.clone());
                 restore_conversation_workspace(&mut self.state, &conversation_id, effects);
+                if project_changed {
+                    if let Some(project) = self.state.projects.get(&project_id).cloned() {
+                        self.queue_git_refresh(&project_id, &project.path, effects)?;
+                    }
+                }
                 self.ensure_conversation_messages_loaded(&conversation_id, effects);
                 self.request_acp_connection(&conversation_id, effects)?;
             }
@@ -2260,7 +2283,6 @@ impl Engine {
             }
             AppEvent::WorkspaceSearchResultSelected { project_id, path } => {
                 self.state.quick_open_open = false;
-                self.state.selected_project_id = Some(project_id.clone());
                 if let Some(project) = self.state.projects.get(&project_id) {
                     self.begin_file_view(project_id, &project.path.clone(), path, None, effects)?;
                 }
@@ -2682,7 +2704,18 @@ impl Engine {
         effects: &mut Vec<EffectCommand>,
     ) -> Result<(), EngineError> {
         let normalized = normalize_workspace_path(&path);
-        self.state.selected_project_id = Some(project_id.clone());
+        let project_changed = switch_selected_project(&mut self.state, project_id.clone());
+        if project_changed {
+            if !self.state.file_tree.contains_key(".") {
+                effects.push(EffectCommand::LoadDirectory {
+                    effect_id: EffectId::new(),
+                    project_id: project_id.clone(),
+                    project_path: project_path.into(),
+                    path: ".".into(),
+                });
+            }
+            self.queue_git_refresh(&project_id, project_path, effects)?;
+        }
         let git_status = self
             .state
             .git_overlays
@@ -4041,6 +4074,27 @@ fn is_agent_active(status: &ConversationStatus) -> bool {
     )
 }
 
+fn reset_project_file_tree_state(state: &mut AppState) {
+    state.file_tree.clear();
+    state.selected_file = None;
+    state.structured_diff = None;
+    state.selected_diff = None;
+    state.file_viewer_loading = false;
+    state.file_viewer_error = None;
+    state.file_viewer_notice = None;
+    state.prev_file_cache.clear();
+    state.structured_diff_cache.clear();
+}
+
+fn switch_selected_project(state: &mut AppState, project_id: ProjectId) -> bool {
+    let changed = state.selected_project_id.as_ref() != Some(&project_id);
+    if changed {
+        reset_project_file_tree_state(state);
+    }
+    state.selected_project_id = Some(project_id);
+    changed
+}
+
 fn persist_current_conversation_workspace(
     state: &mut AppState,
     effects: &mut Vec<EffectCommand>,
@@ -5156,6 +5210,7 @@ fn diff_right_pane_patches(
     next: &RightPaneVm,
 ) -> Result<(), EngineError> {
     const KEY: &str = "rightPane";
+    push_struct_patch_if_changed(patches, &format!("{KEY}.projectName"), &prev.project_name, &next.project_name)?;
     push_struct_patch_if_changed(patches, &format!("{KEY}.mode"), &prev.mode, &next.mode)?;
     push_struct_patch_if_changed(patches, &format!("{KEY}.fileTree"), &prev.file_tree, &next.file_tree)?;
     push_struct_patch_if_changed(patches, &format!("{KEY}.selectedFile"), &prev.selected_file, &next.selected_file)?;
@@ -5167,6 +5222,13 @@ fn diff_right_pane_patches(
     push_struct_patch_if_changed(patches, &format!("{KEY}.selectedDiff"), &prev.selected_diff, &next.selected_diff)?;
     push_struct_patch_if_changed(patches, &format!("{KEY}.preview"), &prev.preview, &next.preview)?;
     push_struct_patch_if_changed(patches, &format!("{KEY}.process"), &prev.process, &next.process)?;
+    push_struct_patch_if_changed(
+        patches,
+        &format!("{KEY}.globalProcesses"),
+        &prev.global_processes,
+        &next.global_processes,
+    )?;
+    push_struct_patch_if_changed(patches, &format!("{KEY}.browserUrl"), &prev.browser_url, &next.browser_url)?;
     push_struct_patch_if_changed(patches, &format!("{KEY}.dispatchTimings"), &prev.dispatch_timings, &next.dispatch_timings)?;
     Ok(())
 }
@@ -5850,6 +5912,131 @@ mod tests {
             .unwrap();
         assert_eq!(row.edited_file_count, 0);
         assert!(row.edited_file_paths.is_empty());
+    }
+
+    #[test]
+    fn conversation_selected_clears_file_tree_when_project_changes() {
+        let mut engine = Engine::new(InitPayload {
+            initial_project_path: Some("/tmp/repo-a".into()),
+        })
+        .unwrap();
+        let project_a = engine.state().selected_project_id.clone().unwrap();
+        engine
+            .handle_input(AppEvent::ConversationCreated {
+                project_id: project_a.clone(),
+            })
+            .unwrap();
+        let conv_a = engine.state().selected_conversation_id.clone().unwrap();
+        engine
+            .handle_input(AppEvent::SystemDirectoryLoaded {
+                project_id: project_a.clone(),
+                path: ".".into(),
+                children: vec![FileNode {
+                    path: "alpha.txt".into(),
+                    name: "alpha.txt".into(),
+                    is_dir: false,
+                    size_bytes: None,
+                    modified_at_ms: None,
+                    ignored: false,
+                    git_status: None,
+                    change_count: None,
+                    synthetic: false,
+                }],
+            })
+            .unwrap();
+
+        let project_b = Project::new("/tmp/repo-b");
+        let project_b_id = project_b.id.clone();
+        engine
+            .state
+            .projects
+            .insert(project_b_id.clone(), project_b);
+        engine
+            .state
+            .project_order
+            .push(project_b_id.clone());
+        let conv_b = Conversation::new(project_b_id.clone());
+        let conv_b_id = conv_b.id.clone();
+        engine
+            .state
+            .conversations
+            .insert(conv_b_id.clone(), conv_b);
+        engine
+            .state
+            .conversation_order
+            .insert(0, conv_b_id.clone());
+        engine
+            .state
+            .messages
+            .insert(conv_b_id.clone(), Vec::new());
+        engine
+            .state
+            .agents
+            .insert(conv_b_id.clone(), AgentRuntime::new(conv_b_id.clone()));
+
+        let output = engine
+            .handle_input(AppEvent::ConversationSelected {
+                conversation_id: conv_b_id.clone(),
+            })
+            .unwrap();
+        assert!(
+            !engine
+                .state()
+                .file_tree
+                .values()
+                .any(|children| children.iter().any(|node| node.name == "alpha.txt")),
+            "stale file tree entries from repo A should be cleared when opening repo B chat"
+        );
+        assert!(output.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                EffectCommand::LoadDirectory {
+                    project_id: id,
+                    ..
+                } if *id == project_b_id
+            )
+        }));
+
+        engine
+            .handle_input(AppEvent::SystemDirectoryLoaded {
+                project_id: project_b_id.clone(),
+                path: ".".into(),
+                children: vec![FileNode {
+                    path: "beta.txt".into(),
+                    name: "beta.txt".into(),
+                    is_dir: false,
+                    size_bytes: None,
+                    modified_at_ms: None,
+                    ignored: false,
+                    git_status: None,
+                    change_count: None,
+                    synthetic: false,
+                }],
+            })
+            .unwrap();
+
+        let output = engine
+            .handle_input(AppEvent::ConversationSelected {
+                conversation_id: conv_a.clone(),
+            })
+            .unwrap();
+        assert!(
+            !engine
+                .state()
+                .file_tree
+                .values()
+                .any(|children| children.iter().any(|node| node.name == "beta.txt")),
+            "stale file tree entries from repo B should be cleared when returning to repo A chat"
+        );
+        assert!(output.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                EffectCommand::LoadDirectory {
+                    project_id: id,
+                    ..
+                } if *id == project_a
+            )
+        }));
     }
 
     #[test]
